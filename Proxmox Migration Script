@@ -30,14 +30,25 @@ else
 fi
 
 echo
-echo "Installing required packages..."
+echo "Installing and updating required packages..."
 
 case "$ID" in
   debian|ubuntu)
+    export DEBIAN_FRONTEND=noninteractive
+
+    echo "Refreshing APT package lists properly..."
+    apt clean
+    rm -rf /var/lib/apt/lists/*
     apt update
+
+    echo "Upgrading all installed packages..."
+    apt -y full-upgrade
+
+    echo "Installing required migration tools..."
     apt install -y qemu-guest-agent initramfs-tools
     ;;
   rhel|centos|rocky|almalinux)
+    dnf -y upgrade
     dnf install -y qemu-guest-agent dracut
     ;;
   *)
@@ -94,9 +105,13 @@ lsinitramfs /boot/initrd.img-$(uname -r) | grep -q virtio && echo "  ✔ Yes" ||
 
 echo
 echo "=== PREP COMPLETE ==="
-echo "If the VM still boots normally, it is safe to:"
-echo "1) Shut it down"
-echo "2) Remove Hyper-V checkpoints"
-echo "3) Copy the latest VHDX"
-echo "4) Import into Proxmox (OVMF + VirtIO)"
+echo "IMPORTANT:"
+echo "- Reboot once to ensure the new kernel/initramfs boots cleanly"
+echo "- Only then shut down and copy the VHDX"
 echo
+echo "Safe next steps:"
+echo "1) Reboot and confirm normal boot"
+echo "2) Shut down"
+echo "3) Remove Hyper-V checkpoints"
+echo "4) Copy the latest VHDX"
+echo "5) Import into Proxmox (OVMF + VirtIO)"
