@@ -70,7 +70,6 @@ if [[ "$ID" == "debian" || "$ID" == "ubuntu" ]]; then
     grep -q "^$mod$" "$MODULES_FILE" || echo "$mod" >> "$MODULES_FILE"
   done
 
-  # Now PATH is sane, this works even on minimal images
   update-initramfs -u -k all
 else
   dracut -f --add-drivers "virtio virtio_blk virtio_scsi virtio_net"
@@ -92,13 +91,24 @@ fi
 echo
 echo "Checking root filesystem mount type..."
 
-ROOT_SRC=$(findmnt -n -o SOURCE /)
+# Prefer checking /etc/fstab (source of truth for portability)
+FSTAB_ROOT_SRC="$(awk '$2=="/" && $1 !~ /^#/ {print $1; exit}' /etc/fstab)"
+# Also check kernel cmdline root= (can be a hidden source of /dev/sdX pinning)
+CMDLINE_ROOT="$(cat /proc/cmdline | tr ' ' '\n' | awk -F= '$1=="root"{print $2}')"
 
-if [[ "$ROOT_SRC" == UUID=* ]]; then
-  echo "Root filesystem uses UUID ✔"
+if [[ "$FSTAB_ROOT_SRC" == UUID=* || "$FSTAB_ROOT_SRC" == /dev/disk/by-uuid/* ]]; then
+  echo "fstab root is UUID-based ✔ ($FSTAB_ROOT_SRC)"
 else
-  echo "WARNING: Root filesystem is mounted via $ROOT_SRC"
+  echo "WARNING: /etc/fstab root is not UUID-based ($FSTAB_ROOT_SRC)"
   echo "You should convert /etc/fstab to UUID-based mounts."
+fi
+
+# Some systems may not include root= on cmdline (initramfs discovers it); treat that as OK
+if [[ -z "$CMDLINE_ROOT" || "$CMDLINE_ROOT" == UUID=* || "$CMDLINE_ROOT" == /dev/disk/by-uuid/* ]]; then
+  echo "Kernel root parameter is UUID-friendly ✔ (root=${CMDLINE_ROOT:-<not set>})"
+else
+  echo "WARNING: Kernel root parameter uses a device path (root=$CMDLINE_ROOT)"
+  echo "This can break after migration if disk naming changes."
 fi
 
 echo
