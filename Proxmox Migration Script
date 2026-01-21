@@ -66,7 +66,9 @@ if [[ "$ID" == "debian" || "$ID" == "ubuntu" ]]; then
   for mod in virtio virtio_blk virtio_scsi virtio_pci virtio_net; do
     grep -q "^$mod$" "$MODULES_FILE" || echo "$mod" >> "$MODULES_FILE"
   done
-  update-initramfs -u -k all
+
+  # Immune to PATH issues on minimal images: call update-initramfs explicitly
+  /usr/sbin/update-initramfs -u -k all
 else
   dracut -f --add-drivers "virtio virtio_blk virtio_scsi virtio_net"
 fi
@@ -100,8 +102,13 @@ echo
 echo "Final sanity checks:"
 
 echo "- Kernel version: $(uname -r)"
-echo "- VirtIO present in initramfs:"
-lsinitramfs /boot/initrd.img-$(uname -r) | grep -q virtio && echo "  ✔ Yes" || echo "  ✖ No"
+
+if [[ "$ID" == "debian" || "$ID" == "ubuntu" ]]; then
+  echo "- VirtIO present in initramfs:"
+  lsinitramfs /boot/initrd.img-$(uname -r) | grep -q virtio && echo "  ✔ Yes" || echo "  ✖ No"
+else
+  echo "- VirtIO present in initramfs: (dracut-based system; check via lsinitrd if installed)"
+fi
 
 echo
 echo "=== PREP COMPLETE ==="
