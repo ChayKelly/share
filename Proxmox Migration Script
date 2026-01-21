@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -e
+
+echo "=== Hyper-V → Proxmox Linux pre-migration prep ==="
+echo
+
+# Must be run as root
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: Please run this script as root (sudo)."
+  exit 1
+fi
+
+# Detect distro
+if [[ -f /etc/os-release ]]; then
+  . /etc/os-release
+else
+  echo "ERROR: Cannot detect OS."
+  exit 1
+fi
+
+echo "Detected OS: $PRETTY_NAME"
+
+# Detect UEFI
+if [[ -d /sys/firmware/efi ]]; then
+  echo "Boot mode: UEFI"
+  UEFI=yes
+else
+  echo "Boot mode: Legacy BIOS"
+  UEFI=no
+fi
+
+echo
+echo "Installing required packages..."
+
+case "$ID" in
+  debian|ubuntu)
+    apt update
+    apt install -y qemu-guest-agent initramfs-tools
+    ;;
+  rhel|centos|rocky|almalinux)
+    dnf install -y qemu-guest-agent dracut
+    ;;
+  *)
+    echo "WARNING: Unsupported distro ($ID). You may need to adapt manually."
+    ;;
+esac
+
+systemctl enable qemu-guest-agent || true
+
+echo
+echo "Ensuring VirtIO drivers are included in initramfs..."
+
+if [[ "$ID" == "debian" || "$ID" == "ubuntu" ]]; then
+  MODULES_FILE="/etc/initramfs-tools/modules"
+  for mod in virtio virtio_blk virtio_scsi virtio_pci virtio_net; do
+    grep -q "^$mod$" "$MODULES_FILE" || echo "$mod" >> "$MODULES_FILE"
+  done
+  update-initramfs -u -k all
+else
+  dracut -f --add-drivers "virtio virtio_blk virtio_scsi virtio_net"
+fi
+
+echo
+echo "Refreshing GRUB configuration..."
+
+if [[ "$UEFI" == "yes" ]]; then
+  grub-install || true
+fi
+
+if command -v update-grub >/dev/null 2>&1; then
+  update-grub
+elif command -v grub2-mkconfig >/dev/null 2>&1; then
+  grub2-mkconfig -o /boot/efi/EFI/*/grub.cfg || true
+fi
+
+echo
+echo "Checking root filesystem mount type..."
+
+ROOT_SRC=$(findmnt -n -o SOURCE /)
+
+if [[ "$ROOT_SRC" == UUID=* ]]; then
+  echo "Root filesystem uses UUID ✔"
+else
+  echo "WARNING: Root filesystem is mounted via $ROOT_SRC"
+  echo "You should convert /etc/fstab to UUID-based mounts."
+fi
+
+echo
+echo "Final sanity checks:"
+
+echo "- Kernel version: $(uname -r)"
+echo "- VirtIO present in initramfs:"
+lsinitramfs /boot/initrd.img-$(uname -r) | grep -q virtio && echo "  ✔ Yes" || echo "  ✖ No"
+
+echo
+echo "=== PREP COMPLETE ==="
+echo "If the VM still boots normally, it is safe to:"
+echo "1) Shut it down"
+echo "2) Remove Hyper-V checkpoints"
+echo "3) Copy the latest VHDX"
+echo "4) Import into Proxmox (OVMF + VirtIO)"
+echo
