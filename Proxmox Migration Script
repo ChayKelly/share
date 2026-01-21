@@ -1,127 +1,19 @@
-#!/usr/bin/env bash
-set -e
+sudo apt update
+sudo apt install -y qemu-guest-agent initramfs-tools
 
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+sudo systemctl enable qemu-guest-agent
 
+sudo tee -a /etc/initramfs-tools/modules <<'EOF'
+virtio
+virtio_blk
+virtio_scsi
+virtio_pci
+virtio_net
+EOF
 
-echo "=== Hyper-V → Proxmox Linux pre-migration prep ==="
-echo
+sudo update-initramfs -u -k all
 
-# Must be run as root
-if [[ $EUID -ne 0 ]]; then
-  echo "ERROR: Please run this script as root (sudo)."
-  exit 1
-fi
+sudo grub-install
+sudo update-grub        # Debian/Ubuntu
 
-# Detect distro
-if [[ -f /etc/os-release ]]; then
-  . /etc/os-release
-else
-  echo "ERROR: Cannot detect OS."
-  exit 1
-fi
-
-echo "Detected OS: $PRETTY_NAME"
-
-# Detect UEFI
-if [[ -d /sys/firmware/efi ]]; then
-  echo "Boot mode: UEFI"
-  UEFI=yes
-else
-  echo "Boot mode: Legacy BIOS"
-  UEFI=no
-fi
-
-echo
-echo "Installing and updating required packages..."
-
-case "$ID" in
-  debian|ubuntu)
-    export DEBIAN_FRONTEND=noninteractive
-
-    echo "Refreshing APT package lists properly..."
-    apt clean
-    rm -rf /var/lib/apt/lists/*
-    apt update
-
-    echo "Upgrading all installed packages..."
-    apt -y full-upgrade
-
-    echo "Installing required migration tools..."
-    apt install -y qemu-guest-agent initramfs-tools
-    ;;
-  rhel|centos|rocky|almalinux)
-    dnf -y upgrade
-    dnf install -y qemu-guest-agent dracut
-    ;;
-  *)
-    echo "WARNING: Unsupported distro ($ID). You may need to adapt manually."
-    ;;
-esac
-
-systemctl enable qemu-guest-agent || true
-
-echo
-echo "Ensuring VirtIO drivers are included in initramfs..."
-
-if [[ "$ID" == "debian" || "$ID" == "ubuntu" ]]; then
-  MODULES_FILE="/etc/initramfs-tools/modules"
-  for mod in virtio virtio_blk virtio_scsi virtio_pci virtio_net; do
-    grep -q "^$mod$" "$MODULES_FILE" || echo "$mod" >> "$MODULES_FILE"
-  done
-
-  # Immune to PATH issues on minimal images: call update-initramfs explicitly
-  /usr/sbin/update-initramfs -u -k all
-else
-  dracut -f --add-drivers "virtio virtio_blk virtio_scsi virtio_net"
-fi
-
-echo
-echo "Refreshing GRUB configuration..."
-
-if [[ "$UEFI" == "yes" ]]; then
-  grub-install || true
-fi
-
-if command -v update-grub >/dev/null 2>&1; then
-  update-grub
-elif command -v grub2-mkconfig >/dev/null 2>&1; then
-  grub2-mkconfig -o /boot/efi/EFI/*/grub.cfg || true
-fi
-
-echo
-echo "Checking root filesystem mount type..."
-
-ROOT_SRC=$(findmnt -n -o SOURCE /)
-
-if [[ "$ROOT_SRC" == UUID=* ]]; then
-  echo "Root filesystem uses UUID ✔"
-else
-  echo "WARNING: Root filesystem is mounted via $ROOT_SRC"
-  echo "You should convert /etc/fstab to UUID-based mounts."
-fi
-
-echo
-echo "Final sanity checks:"
-
-echo "- Kernel version: $(uname -r)"
-
-if [[ "$ID" == "debian" || "$ID" == "ubuntu" ]]; then
-  echo "- VirtIO present in initramfs:"
-  lsinitramfs /boot/initrd.img-$(uname -r) | grep -q virtio && echo "  ✔ Yes" || echo "  ✖ No"
-else
-  echo "- VirtIO present in initramfs: (dracut-based system; check via lsinitrd if installed)"
-fi
-
-echo
-echo "=== PREP COMPLETE ==="
-echo "IMPORTANT:"
-echo "- Reboot once to ensure the new kernel/initramfs boots cleanly"
-echo "- Only then shut down and copy the VHDX"
-echo
-echo "Safe next steps:"
-echo "1) Reboot and confirm normal boot"
-echo "2) Shut down"
-echo "3) Remove Hyper-V checkpoints"
-echo "4) Copy the latest VHDX"
-echo "5) Import into Proxmox (OVMF + VirtIO)"
+grep -E ' / ' /etc/fstab
