@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Hyper-V (Gen 2 / UEFI) → Proxmox (OVMF) Linux prep
+# - Installs qemu-guest-agent
+# - Ensures VirtIO modules are in initramfs
+# - Ensures EFI System Partition is mounted at /boot/efi
+# - Reinstalls GRUB to the ESP with a portable path (EFI/<BOOTLOADER_ID>/grubx64.efi)
+# - Creates/cleans EFI boot entries to prefer that portable GRUB path
+#
+# Run inside the Hyper-V VM as root:
+#   sudo bash prep-hv-to-proxmox.sh
+#
+# After it completes:
+#   1) Reboot once
+#   2) Confirm it boots normally
+#   3) Shutdown and copy the latest VHDX (after removing checkpoints)
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+LOG_PREFIX="[HV→PVE PREP]"
+
+info() { echo "${LOG_PREFIX} $*"; }
+warn() { echo "${LOG_PREFIX} WARNING: $*" >&2; }
+die()  { echo "${LOG_PREFIX} ERROR: $*" >&2; exit 1; }
+
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Please run as root (sudo)."
+}
+
+detect_os() {
+  [[ -f /etc/os-release ]] || die "Cannot detect OS (/etc/os-release missing)."
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS_ID="${ID:-unknown}"
+  OS_PRETTY="${PRETTY_NAME:-$OS_ID}"
+  info "Detected OS: ${OS_PRETTY}"
+}
+
+detect_uefi() {
+  if [[ -d /sys/firmware/efi ]]; then
+    UEFI="yes"
+    info "Boot mode: UEFI"
+  else
+    UEFI="no"
+    die "This system is NOT booted in UEFI mode. For Hyper-V Gen 2 → Proxmox OVMF, the VM must boot UEFI. Fix this first, then rerun."
+  fi
+}
+
+run_apt() {
+  export DEBIAN_FRONTEND=noninteractive
+  info "Refreshing APT lists…"
+  apt clean -y >/dev/null 2>&1 || true
+  rm -rf /var/lib/apt/lists/* || true
+  apt update
+}
+
+install_packages_debian() {
+  run_apt
+  info "Upgrading installed packages…"
+  apt -y full-upgrade
+
+  info "Installing required packages…"
+  # efibootmgr is needed to manage UEFI boot entries
+  # grub-efi-amd64 is required to install GRUB to the EFI System Partition
+  apt install -y \
+    qemu-guest-agent \
+    initramfs-tools \
+    efibootmgr \
+    grub-efi-amd64 \
+    grub-efi-amd64-signed \
+    shim-signed \
+    parted \
+    gdisk \
+    util-linux
+}
+
+install_packages_rhel() {
+  info "Upgrading installed packages…"
+  dnf -y upgrade
+
+  info "Installing required packages…"
+  dnf install -y \
+    qemu-guest-agent \
+    efibootmgr \
+    grub2-efi-x64 \
+    shim-x64 \
+    dracut \
+    parted \
+    gdisk \
+    util-linux
+}
+
+enable_qga() {
+  info "Enabling qemu-guest-agent…"
+  systemctl enable qemu-guest-agent >/dev/null 2>&1 || true
+  systemctl start qemu-guest-agent >/dev/null 2>&1 || true
+}
+
+find_esp() {
+  info "Locating EFI System Partition (ESP)…"
+
+  # Find a partition flagged as ESP/boot or with vfat + parttype EF00
+  # Prefer lsblk + PARTFLAGS when available
+  ESP_DEV=""
+  while read -r dev fstype partflags parttype mountpoint; do
+    # dev is like /dev/sda1
+    if [[ "${fstype}" == "vfat" || "${fstype}" == "fat32" ]]; then
+      if [[ "${partflags}" == *"esp"* || "${partflags}" == *"boot"* || "${parttype}" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]]; then
+        ESP_DEV="${dev}"
+        ESP_MNT="${mountpoint}"
+        break
+      fi
+    fi
+  done < <(lsblk -rpno NAME,FSTYPE,PARTFLAGS,PARTTYPE,MOUNTPOINT 2>/dev/null || true)
+
+  # Fallback: try blkid for vfat and then validate via parted flags
+  if [[ -z "${ESP_DEV}" ]]; then
+    while read -r dev; do
+      if [[ -b "${dev}" ]]; then
+        # Check flags with parted (if installed)
+        if command -v parted >/dev/null 2>&1; then
+          parent="$(lsblk -no PKNAME "${dev}" 2>/dev/null | head -n1 || true)"
+          [[ -n "${parent}" ]] || continue
+          disk="/dev/${parent}"
+          num="$(lsblk -no PARTNUM "${dev}" 2>/dev/null | head -n1 || true)"
+          [[ -n "${num}" ]] || continue
+          flags="$(parted -s "${disk}" print 2>/dev/null | awk -v n="${num}" '$1==n {print $0}')"
+          if echo "${flags}" | grep -qiE 'esp|boot'; then
+            ESP_DEV="${dev}"
+            ESP_MNT="$(findmnt -no TARGET "${dev}" 2>/dev/null || true)"
+            break
+          fi
+        fi
+      fi
+    done < <(blkid -t TYPE=vfat -o device 2>/dev/null || true)
+  fi
+
+  [[ -n "${ESP_DEV}" ]] || die "Could not find an EFI System Partition (ESP). If this is truly a Gen 2 VM, investigate disk layout before proceeding."
+
+  info "ESP device: ${ESP_DEV} (currently mounted at: ${ESP_MNT:-<not mounted>})"
+}
+
+ensure_esp_mounted() {
+  # Standard mountpoint
+  mkdir -p /boot/efi
+
+  if findmnt -no TARGET "${ESP_DEV}" >/dev/null 2>&1; then
+    # Already mounted somewhere; ensure it's /boot/efi
+    current="$(findmnt -no TARGET "${ESP_DEV}")"
+    if [[ "${current}" != "/boot/efi" ]]; then
+      warn "ESP is mounted at ${current}. Remounting at /boot/efi for a clean GRUB install."
+      umount "${ESP_DEV}" || die "Failed to unmount ESP from ${current}."
+      mount "${ESP_DEV}" /boot/efi || die "Failed to mount ESP at /boot/efi."
+    else
+      info "ESP already mounted at /boot/efi ✔"
+    fi
+  else
+    info "Mounting ESP at /boot/efi…"
+    mount "${ESP_DEV}" /boot/efi || die "Failed to mount ESP at /boot/efi."
+  fi
+
+  # Sanity: must be vfat
+  fstype="$(findmnt -no FSTYPE /boot/efi || true)"
+  [[ "${fstype}" == "vfat" ]] || warn "ESP at /boot/efi is not vfat (got ${fstype}). This is unusual."
+}
+
+ensure_virtio_in_initramfs_debian() {
+  info "Ensuring VirtIO modules are included in initramfs…"
+  local modules_file="/etc/initramfs-tools/modules"
+  touch "${modules_file}"
+
+  for mod in virtio virtio_blk virtio_scsi virtio_pci virtio_net; do
+    grep -qE "^${mod}$" "${modules_file}" || echo "${mod}" >> "${modules_file}"
+  done
+
+  update-initramfs -u -k all
+}
+
+ensure_virtio_in_initramfs_dracut() {
+  info "Ensuring VirtIO drivers are included in initramfs (dracut)…"
+  dracut -f --add-drivers "virtio virtio_blk virtio_scsi virtio_pci virtio_net"
+}
+
+# Create a portable fallback boot path too: EFI/BOOT/BOOTX64.EFI
+create_fallback_bootx64() {
+  info "Ensuring a fallback bootloader exists at EFI/BOOT/BOOTX64.EFI (helps when NVRAM entries break)…"
+  mkdir -p /boot/efi/EFI/BOOT
+
+  local candidate=""
+  # Common GRUB/shim locations
+  for p in \
+    /boot/efi/EFI/*/shimx64.efi \
+    /boot/efi/EFI/*/grubx64.efi \
+    /usr/lib/shim/shimx64.efi \
+    /usr/lib/grub/x86_64-efi/grub.efi; do
+    if ls ${p} >/dev/null 2>&1; then
+      candidate="$(ls ${p} 2>/dev/null | head -n1)"
+      break
+    fi
+  done
+
+  # Prefer using the installed shim/grub from the ESP if present
+  if [[ -z "${candidate}" ]]; then
+    warn "Could not locate a suitable candidate to copy to BOOTX64.EFI automatically. This is not fatal, but less resilient."
+    return 0
+  fi
+
+  # If candidate is from /usr, copy it. If from /boot/efi, copy that too.
+  cp -f "${candidate}" /boot/efi/EFI/BOOT/BOOTX64.EFI || warn "Failed to create BOOTX64.EFI fallback."
+  info "Fallback BOOTX64.EFI created/updated ✔"
+}
+
+set_bootloader_id() {
+  # You can override: BOOTLOADER_ID=myid sudo bash script.sh
+  BOOTLOADER_ID="${BOOTLOADER_ID:-debian}"
+  # Sanitise to safe characters for ESP directory names
+  BOOTLOADER_ID="$(echo "${BOOTLOADER_ID}" | tr -cd 'A-Za-z0-9_-')"
+  [[ -n "${BOOTLOADER_ID}" ]] || BOOTLOADER_ID="debian"
+  info "Using bootloader ID: ${BOOTLOADER_ID}"
+}
+
+reinstall_grub_uefi_debian() {
+  set_bootloader_id
+  info "Reinstalling GRUB to the ESP (portable UEFI install)…"
+  grub-install \
+    --target=x86_64-efi \
+    --efi-directory=/boot/efi \
+    --bootloader-id="${BOOTLOADER_ID}" \
+    --recheck
+
+  update-grub
+}
+
+reinstall_grub_uefi_rhel() {
+  set_bootloader_id
+  info "Reinstalling GRUB to the ESP (portable UEFI install)…"
+  grub2-install \
+    --target=x86_64-efi \
+    --efi-directory=/boot/efi \
+    --bootloader-id="${BOOTLOADER_ID}" \
+    --recheck || true
+
+  # RHEL family commonly uses grub2-mkconfig
+  if [[ -f /etc/grub2-efi.cfg ]]; then
+    grub2-mkconfig -o /etc/grub2-efi.cfg
+  elif [[ -f /boot/efi/EFI/${BOOTLOADER_ID}/grub.cfg ]]; then
+    grub2-mkconfig -o "/boot/efi/EFI/${BOOTLOADER_ID}/grub.cfg"
+  else
+    grub2-mkconfig -o /boot/grub2/grub.cfg || true
+  fi
+}
+
+clean_and_set_efi_bootentry() {
+  set_bootloader_id
+  info "Normalising EFI boot entries to prefer ${BOOTLOADER_ID}…"
+
+  command -v efibootmgr >/dev/null 2>&1 || { warn "efibootmgr not found; skipping EFI boot entry clean-up."; return 0; }
+
+  # Create a fresh entry pointing at \EFI\<ID>\grubx64.efi if it exists
+  local efi_path="/boot/efi/EFI/${BOOTLOADER_ID}/grubx64.efi"
+  if [[ ! -f "${efi_path}" ]]; then
+    # Some distros place shim first
+    if [[ -f "/boot/efi/EFI/${BOOTLOADER_ID}/shimx64.efi" ]]; then
+      efi_path="/boot/efi/EFI/${BOOTLOADER_ID}/shimx64.efi"
+    else
+      warn "Expected bootloader not found at /boot/efi/EFI/${BOOTLOADER_ID}/(grubx64.efi|shimx64.efi). Skipping boot entry creation."
+      return 0
+    fi
+  fi
+
+  # Determine disk + partition number for ESP
+  local esp_partnum esp_disk
+  esp_partnum="$(lsblk -no PARTNUM "${ESP_DEV}" | head -n1 || true)"
+  esp_disk="/dev/$(lsblk -no PKNAME "${ESP_DEV}" | head -n1 || true)"
+  [[ -n "${esp_partnum}" && -b "${esp_disk}" ]] || { warn "Could not derive ESP disk/partition for efibootmgr. Skipping."; return 0; }
+
+  # Windows-style backslashes for UEFI path
+  local uefi_relpath
+  uefi_relpath="\\EFI\\${BOOTLOADER_ID}\\$(basename "${efi_path}")"
+
+  # Add entry (may create duplicate if already present; we'll tidy)
+  efibootmgr -c -d "${esp_disk}" -p "${esp_partnum}" -L "${BOOTLOADER_ID}" -l "${uefi_relpath}" >/dev/null 2>&1 || true
+
+  # Now prefer this entry first in BootOrder if present
+  local bootnums
+  bootnums="$(efibootmgr | awk -v id="${BOOTLOADER_ID}" '$0 ~ ("Boot[0-9A-Fa-f]{4}\\* "id) {gsub(/^Boot/,"",$1); gsub(/\*$/,"",$1); print $1}' || true)"
+
+  if [[ -n "${bootnums}" ]]; then
+    # Pick the last created (usually last line) as primary
+    local primary
+    primary="$(echo "${bootnums}" | tail -n1)"
+    # Build new boot order with primary first, preserving others
+    local current_order rest
+    current_order="$(efibootmgr | awk -F'[:, ]+' '/BootOrder:/ {print $2}' | tr ',' ' ' || true)"
+    rest="$(echo "${current_order}" | tr ' ' '\n' | grep -vi "^${primary}$" | tr '\n' ',' | sed 's/,$//' || true)"
+
+    if [[ -n "${rest}" ]]; then
+      efibootmgr -o "${primary},${rest}" >/dev/null 2>&1 || true
+    else
+      efibootmgr -o "${primary}" >/dev/null 2>&1 || true
+    fi
+    info "Set BootOrder to prefer ${BOOTLOADER_ID} (Boot${primary}) ✔"
+  else
+    warn "Could not locate a ${BOOTLOADER_ID} boot entry in efibootmgr output."
+  fi
+
+  # Optional clean-up: remove obviously Hyper-V-ish entries that commonly break after migration
+  # We avoid being too aggressive; this only removes entries with label matching these patterns.
+  local patterns=('UEFI QEMU HARDDISK' 'Windows Boot Manager' 'ubuntu' 'debian' 'centos' 'redhat' 'fedora')
+  # ^ We won't delete distro entries; only delete Windows/Hyper-V-ish if present AND not our BOOTLOADER_ID.
+  # Safer: delete only "Windows Boot Manager" and "UEFI QEMU HARDDISK".
+  while read -r line; do
+    local num label
+    num="$(echo "${line}" | awk '{print $1}' | sed -E 's/^Boot([0-9A-Fa-f]{4}).*/\1/')"
+    label="$(echo "${line}" | sed -E 's/^Boot[0-9A-Fa-f]{4}\*?\s+//')"
+    if echo "${label}" | grep -qiE 'Windows Boot Manager|UEFI QEMU HARDDISK'; then
+      efibootmgr -b "${num}" -B >/dev/null 2>&1 || true
+      info "Removed EFI entry Boot${num} (${label})"
+    fi
+  done < <(efibootmgr | grep -E '^Boot[0-9A-Fa-f]{4}\*' || true)
+}
+
+check_uuid_mounts() {
+  info "Checking root mount uses UUID in /etc/fstab (recommended)…"
+  local fstab_root
+  fstab_root="$(awk '$2=="/" && $1 !~ /^#/ {print $1; exit}' /etc/fstab 2>/dev/null || true)"
+
+  if [[ -z "${fstab_root}" ]]; then
+    warn "Could not find a root (/) entry in /etc/fstab. This may be fine if your initramfs discovers root automatically, but check carefully."
+    return 0
+  fi
+
+  if [[ "${fstab_root}" == UUID=* || "${fstab_root}" == /dev/disk/by-uuid/* ]]; then
+    info "fstab root is UUID-based ✔ (${fstab_root})"
+  else
+    warn "fstab root is not UUID-based (${fstab_root}). Consider converting to UUID to avoid disk renaming issues after migration."
+  fi
+
+  local cmdline_root
+  cmdline_root="$(tr ' ' '\n' < /proc/cmdline | awk -F= '$1=="root"{print $2}' | head -n1 || true)"
+  if [[ -z "${cmdline_root}" || "${cmdline_root}" == UUID=* || "${cmdline_root}" == /dev/disk/by-uuid/* ]]; then
+    info "Kernel root parameter is UUID-friendly ✔ (root=${cmdline_root:-<not set>})"
+  else
+    warn "Kernel root parameter uses a device path (root=${cmdline_root}). This can break after migration if names change."
+  fi
+}
+
+final_sanity() {
+  info "Final sanity checks:"
+  info "- Kernel: $(uname -r)"
+  info "- ESP mount: $(findmnt -no SOURCE,TARGET,FSTYPE /boot/efi 2>/dev/null || echo '<not mounted>')"
+  info "- Boot entries (efibootmgr):"
+  efibootmgr || true
+
+  if command -v lsinitramfs >/dev/null 2>&1; then
+    info "- VirtIO present in initramfs:"
+    if lsinitramfs "/boot/initrd.img-$(uname -r)" | grep -q virtio; then
+      info "  ✔ Yes"
+    else
+      warn "  ✖ Could not detect VirtIO modules in initramfs output. This may still be OK depending on your distro/kernel config, but it’s worth double-checking."
+    fi
+  fi
+}
+
+main() {
+  require_root
+  detect_os
+  detect_uefi
+
+  case "${OS_ID}" in
+    debian|ubuntu)
+      install_packages_debian
+      ;;
+    rhel|centos|rocky|almalinux|fedora)
+      install_packages_rhel
+      ;;
+    *)
+      die "Unsupported distro ID (${OS_ID}). If you tell me the distro, I’ll adapt the script safely."
+      ;;
+  esac
+
+  enable_qga
+  find_esp
+  ensure_esp_mounted
+
+  case "${OS_ID}" in
+    debian|ubuntu)
+      ensure_virtio_in_initramfs_debian
+      reinstall_grub_uefi_debian
+      ;;
+    *)
+      ensure_virtio_in_initramfs_dracut
+      reinstall_grub_uefi_rhel
+      ;;
+  esac
+
+  create_fallback_bootx64
+  clean_and_set_efi_bootentry
+  check_uuid_mounts
+  final_sanity
+
+  info "=== PREP COMPLETE ==="
+  echo
+  info "Next steps (important):"
+  info "1) Reboot once and confirm it boots cleanly in Hyper-V"
+  info "2) Shutdown"
+  info "3) Remove Hyper-V checkpoints (if any)"
+  info "4) Copy the latest VHDX and import into Proxmox (OVMF + VirtIO SCSI)"
+  echo
+}
+
+main "$@"
