@@ -1,0 +1,1 @@
+[ -d /sys/firmware/efi ] && echo "UEFI booted" || echo "NOT UEFI booted"
